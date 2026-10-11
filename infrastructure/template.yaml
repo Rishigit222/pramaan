@@ -1,0 +1,133 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Pramaan backend foundation (us-east-1; scaffold only)
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedPattern: '^[a-z0-9-]+$'
+  CorsOrigin:
+    Type: String
+    Default: http://localhost:5173
+  EvidenceObjectLock:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: Object Lock must be chosen at bucket creation and cannot be added later.
+
+Conditions:
+  UseObjectLock: !Equals [!Ref EvidenceObjectLock, 'true']
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Timeout: 15
+    MemorySize: 256
+    Environment:
+      Variables:
+        MOCK_MODE: 'false'
+        CASE_TABLE: !Ref CaseTable
+        EVIDENCE_BUCKET: !Ref EvidenceBucket
+        SIGNING_KEY_ID: !Ref SigningKey
+        OBJECT_LOCK_ENABLED: !Ref EvidenceObjectLock
+        AWS_REGION_NAME: !Ref AWS::Region
+
+Resources:
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub pramaan-${Environment}-users
+      UsernameAttributes: [email]
+      AutoVerifiedAttributes: [email]
+      Policies:
+        PasswordPolicy: {MinimumLength: 12, RequireUppercase: true, RequireLowercase: true, RequireNumbers: true, RequireSymbols: true}
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref UserPool
+      ClientName: !Sub pramaan-${Environment}-web
+      GenerateSecret: false
+      ExplicitAuthFlows: [ALLOW_USER_PASSWORD_AUTH, ALLOW_REFRESH_TOKEN_AUTH]
+
+  Api:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: v1
+      Cors: !Sub "'${CorsOrigin}'"
+      Auth:
+        DefaultAuthorizer: CognitoAuthorizer
+        Authorizers:
+          CognitoAuthorizer:
+            UserPoolArn: !GetAtt UserPool.Arn
+
+  ApiFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../backend/
+      Handler: src.handler.lambda_handler
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:Scan]
+              Resource: !GetAtt CaseTable.Arn
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource: !Sub ${EvidenceBucket.Arn}/cases/*
+        - Statement:
+            - Effect: Allow
+              Action: [kms:Sign, kms:GetPublicKey, kms:DescribeKey]
+              Resource: !GetAtt SigningKey.Arn
+      Events:
+        CreateCase: {Type: Api, Properties: {RestApiId: !Ref Api, Path: /cases, Method: post}}
+        ListCases: {Type: Api, Properties: {RestApiId: !Ref Api, Path: /cases, Method: get}}
+        GetCase: {Type: Api, Properties: {RestApiId: !Ref Api, Path: /cases/{caseId}, Method: get}}
+        IngestComplaint: {Type: Api, Properties: {RestApiId: !Ref Api, Path: /complaints, Method: post}}
+        Verification: {Type: Api, Properties: {RestApiId: !Ref Api, Path: /cases/{caseId}/verification, Method: get}}
+
+  CaseTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      PointInTimeRecoverySpecification: {PointInTimeRecoveryEnabled: true}
+      SSESpecification: {SSEEnabled: true}
+      AttributeDefinitions: [{AttributeName: caseId, AttributeType: S}]
+      KeySchema: [{AttributeName: caseId, KeyType: HASH}]
+
+  EvidenceBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketEncryption: {ServerSideEncryptionConfiguration: [{ServerSideEncryptionByDefault: {SSEAlgorithm: AES256}}]}
+      VersioningConfiguration: {Status: Enabled}
+      ObjectLockEnabled: !If [UseObjectLock, true, !Ref AWS::NoValue]
+      PublicAccessBlockConfiguration: {BlockPublicAcls: true, BlockPublicPolicy: true, IgnorePublicAcls: true, RestrictPublicBuckets: true}
+      CorsConfiguration: {CorsRules: [{AllowedOrigins: [!Ref CorsOrigin], AllowedMethods: [GET, PUT], AllowedHeaders: ['*'], ExposedHeaders: [ETag]}]}
+
+  SigningKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: Pramaan evidence manifest signing key (asymmetric; sign/verify only)
+      KeySpec: ECC_NIST_P256
+      KeyUsage: SIGN_VERIFY
+      EnableKeyRotation: false
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AccountAdministration
+            Effect: Allow
+            Principal: {AWS: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:root}
+            Action: 'kms:*'
+            Resource: '*'
+  SigningAlias:
+    Type: AWS::KMS::Alias
+    Properties: {AliasName: !Sub alias/pramaan-${Environment}-signing, TargetKeyId: !Ref SigningKey}
+
+Outputs:
+  ApiUrl: {Value: !Sub https://${Api}.execute-api.${AWS::Region}.amazonaws.com/v1}
+  UserPoolId: {Value: !Ref UserPool}
+  UserPoolClientId: {Value: !Ref UserPoolClient}
+  CaseTableName: {Value: !Ref CaseTable}
+  EvidenceBucketName: {Value: !Ref EvidenceBucket}
+  SigningKeyArn: {Value: !GetAtt SigningKey.Arn}

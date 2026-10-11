@@ -1,0 +1,1 @@
+# boto3 is supplied by the AWS Lambda Python runtime; pin/package it for local SAM only if desired.

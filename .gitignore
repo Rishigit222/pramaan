@@ -1,0 +1,15 @@
+node_modules/
+dist/
+*.tsbuildinfo
+.rocketride/
+.env
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.coverage
+htmlcov/
+*.egg-info/
+venv/
+.venv/
+env/
